@@ -4,23 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nocd.nn.gcn import sparse_or_dense_dropout
 from nocd.utils import to_sparse_tensor
 
 __all__ = [
-    'GCN',
-    'GraphConvolution',
+    'ImprovedGCN',
+    'ImpGraphConvolution',
 ]
 
 
-def sparse_or_dense_dropout(x, p=0.5, training=True):
-    if isinstance(x, (torch.sparse.FloatTensor, torch.cuda.sparse.FloatTensor)):
-        new_values = F.dropout(x.values(), p=p, training=training)
-        return torch.cuda.sparse.FloatTensor(x.indices(), new_values, x.size())
-    else:
-        return F.dropout(x, p=p, training=training)
-
-
-class GraphConvolution(nn.Module):
+class ImpGraphConvolution(nn.Module):
     """Graph convolution layer.
 
     Args:
@@ -32,45 +25,50 @@ class GraphConvolution(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        self.weight_own = nn.Parameter(torch.empty(in_features, out_features))
+        self.weight_nbr = nn.Parameter(torch.empty(in_features, out_features))
         self.bias = nn.Parameter(torch.empty(out_features))
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.weight)
+        nn.init.xavier_uniform_(self.weight_own, gain=2.0)
+        nn.init.xavier_uniform_(self.weight_nbr, gain=2.0)
         nn.init.zeros_(self.bias)
 
     def forward(self, x, adj):
-        return adj @ (x @ self.weight) + self.bias
+        return adj @ (x @ self.weight_nbr) + x @ self.weight_own + self.bias
 
 
-class GCN(nn.Module):
-    """Graph convolution network.
+class ImprovedGCN(nn.Module):
+    """An improved GCN architecture.
 
-    References:
-        "Semi-superivsed learning with graph convolutional networks",
-        Kipf and Welling, ICLR 2017
+    This version uses two weight matrices for self-propagation and aggregation,
+    doesn't use batchnorm, and uses Tanh instead of ReLU nonlinearities.
+    Has more stable training / faster convergence than standard GCN for overlapping
+    community detection.
+
+    This improved architecture was inspired by https://arxiv.org/abs/1906.12192
     """
-    def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.5, batch_norm=False):
+    def __init__(self, input_dim, hidden_dims, output_dim, dropout=0.5, layer_norm=False):
         super().__init__()
         self.dropout = dropout
         layer_dims = np.concatenate([hidden_dims, [output_dim]]).astype(np.int32)
-        self.layers = nn.ModuleList([GraphConvolution(input_dim, layer_dims[0])])
+        self.layers = nn.ModuleList([ImpGraphConvolution(input_dim, layer_dims[0])])
         for idx in range(len(layer_dims) - 1):
-            self.layers.append(GraphConvolution(layer_dims[idx], layer_dims[idx + 1]))
-        if batch_norm:
-            self.batch_norm = [
-                nn.BatchNorm1d(dim, affine=False, track_running_stats=False) for dim in hidden_dims
+            self.layers.append(ImpGraphConvolution(layer_dims[idx], layer_dims[idx + 1]))
+        if layer_norm:
+            self.layer_norm = [
+                nn.LayerNorm([dim], elementwise_affine=False) for dim in hidden_dims
             ]
         else:
-            self.batch_norm = None
+            self.layer_norm = None
 
     @staticmethod
-    def normalize_adj(adj : sp.csr_matrix, cuda=True):
+    def normalize_adj(adj : sp.csr_matrix):
         """Normalize adjacency matrix and convert it to a sparse tensor."""
         if sp.isspmatrix(adj):
             adj = adj.tolil()
-            adj.setdiag(1)
+            adj.setdiag(0)
             adj = adj.tocsr()
             deg = np.ravel(adj.sum(1))
             deg_sqrt_inv = 1 / np.sqrt(deg)
@@ -79,7 +77,7 @@ class GCN(nn.Module):
             deg = adj.sum(1)
             deg_sqrt_inv = 1 / torch.sqrt(deg)
             adj_norm = adj * deg_sqrt_inv[:, None] * deg_sqrt_inv[None, :]
-        return to_sparse_tensor(adj_norm, cuda)
+        return to_sparse_tensor(adj_norm)
 
     def forward(self, x, adj):
         for idx, gcn in enumerate(self.layers):
@@ -87,9 +85,9 @@ class GCN(nn.Module):
                 x = sparse_or_dense_dropout(x, p=self.dropout, training=self.training)
             x = gcn(x, adj)
             if idx != len(self.layers) - 1:
-                x = F.relu(x)
-                if self.batch_norm is not None:
-                    x = self.batch_norm[idx](x)
+                x = torch.tanh(x)
+                if self.layer_norm is not None:
+                    x = self.layer_norm[idx](x)
         return x
 
     def get_weights(self):

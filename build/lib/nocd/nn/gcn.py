@@ -66,7 +66,7 @@ class GCN(nn.Module):
             self.batch_norm = None
 
     @staticmethod
-    def normalize_adj(adj : sp.csr_matrix, cuda=True):
+    def normalize_adj(adj : sp.csr_matrix):
         """Normalize adjacency matrix and convert it to a sparse tensor."""
         if sp.isspmatrix(adj):
             adj = adj.tolil()
@@ -79,7 +79,7 @@ class GCN(nn.Module):
             deg = adj.sum(1)
             deg_sqrt_inv = 1 / torch.sqrt(deg)
             adj_norm = adj * deg_sqrt_inv[:, None] * deg_sqrt_inv[None, :]
-        return to_sparse_tensor(adj_norm, cuda)
+        return to_sparse_tensor(adj_norm)
 
     def forward(self, x, adj):
         for idx, gcn in enumerate(self.layers):
